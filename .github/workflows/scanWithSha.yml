@@ -1,0 +1,243 @@
+name: Check Docker Image Certificates
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: "Docker image name. Examples: nginx, nginx:1.27, nginx@sha256:abc..."
+        required: true
+        type: string
+
+      image_version:
+        description: "Optional image version/tag. Leave empty when image_name already contains :tag or @sha256:digest"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  check-certificates:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build image reference
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMAGE_VERSION="${{ inputs.image_version }}"
+
+          # Remove accidental whitespace
+          IMAGE_NAME="$(echo "$IMAGE_NAME" | xargs)"
+          IMAGE_VERSION="$(echo "$IMAGE_VERSION" | xargs)"
+
+          if [[ -z "$IMAGE_NAME" ]]; then
+            echo "ERROR: image_name cannot be empty"
+            exit 1
+          fi
+
+          # If image_name already contains a digest,
+          # do NOT append a tag.
+          if [[ "$IMAGE_NAME" == *@sha256:* ]]; then
+
+            if [[ -n "$IMAGE_VERSION" ]]; then
+              echo "ERROR: Do not specify image_version when using a sha256 digest."
+              echo "Example: nginx@sha256:abc123..."
+              exit 1
+            fi
+
+            IMAGE="$IMAGE_NAME"
+
+          # If image_name already contains an explicit tag,
+          # do not append another tag.
+          elif [[ "$IMAGE_NAME" == *:* && "$IMAGE_NAME" != */*:* ]]; then
+
+            if [[ -n "$IMAGE_VERSION" ]]; then
+              echo "ERROR: image_name already contains a tag."
+              echo "Use either:"
+              echo "  image_name=nginx"
+              echo "  image_version=1.27"
+              echo "OR:"
+              echo "  image_name=nginx:1.27"
+              exit 1
+            fi
+
+            IMAGE="$IMAGE_NAME"
+
+          elif [[ "$IMAGE_NAME" == */*:* ]]; then
+
+            if [[ -n "$IMAGE_VERSION" ]]; then
+              echo "ERROR: image_name already contains a tag."
+              exit 1
+            fi
+
+            IMAGE="$IMAGE_NAME"
+
+          else
+
+            if [[ -n "$IMAGE_VERSION" ]]; then
+              IMAGE="${IMAGE_NAME}:${IMAGE_VERSION}"
+            else
+              IMAGE="${IMAGE_NAME}:latest"
+            fi
+
+          fi
+
+          echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "Final Docker image:"
+          echo "$IMAGE"
+
+      - name: Pull Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          echo "Pulling: $IMAGE"
+
+          docker pull "$IMAGE"
+
+      - name: Check certificates for Himanshu
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          mkdir -p certificate-results
+
+          {
+            echo "Docker Image: $IMAGE"
+            echo "Search Name: Himanshu"
+            echo ""
+            echo "=============================================="
+            echo "Certificates"
+            echo "=============================================="
+          } | tee certificate-results/certificates.txt
+
+          echo "Finding certificate files..."
+
+          docker run --rm \
+            --user 0 \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c '
+              if command -v find >/dev/null 2>&1; then
+                find / \
+                  -type f \
+                  \( \
+                    -iname "*.crt" \
+                    -o -iname "*.cer" \
+                    -o -iname "*.pem" \
+                    -o -iname "*.der" \
+                  \) \
+                  -print 2>/dev/null
+              else
+                echo "ERROR: find command is not available"
+              fi
+            ' > certificate-results/all-certificates.txt
+
+          echo "" >> certificate-results/certificates.txt
+          echo "All certificate files found:" \
+            | tee -a certificate-results/certificates.txt
+
+          if [[ -s certificate-results/all-certificates.txt ]]; then
+            cat certificate-results/all-certificates.txt \
+              | tee -a certificate-results/certificates.txt
+          else
+            echo "No certificate files found." \
+              | tee -a certificate-results/certificates.txt
+          fi
+
+          {
+            echo ""
+            echo "=============================================="
+            echo "Checking certificate subject/issuer for Himanshu"
+            echo "=============================================="
+          } | tee -a certificate-results/certificates.txt
+
+          docker run --rm \
+            --user 0 \
+            --entrypoint /bin/sh \
+            -v "$PWD/certificate-results:/results" \
+            "$IMAGE" \
+            -c '
+              FOUND=0
+
+              while IFS= read -r CERT; do
+
+                [ -z "$CERT" ] && continue
+
+                echo ""
+                echo "Certificate: $CERT"
+
+                if command -v openssl >/dev/null 2>&1; then
+
+                  OUTPUT=$(openssl x509 \
+                    -in "$CERT" \
+                    -noout \
+                    -subject \
+                    -issuer \
+                    -dates \
+                    2>/dev/null || true)
+
+                  if echo "$OUTPUT" | grep -qi "Himanshu"; then
+                    echo "MATCH: Himanshu"
+                    echo "$OUTPUT"
+                    FOUND=1
+                  fi
+
+                else
+
+                  echo "WARNING: openssl is not installed in the image"
+
+                fi
+
+              done < /results/all-certificates.txt
+
+              echo ""
+
+              if [ "$FOUND" -eq 1 ]; then
+                echo "RESULT: Himanshu certificate FOUND"
+              else
+                echo "RESULT: Himanshu certificate NOT FOUND"
+              fi
+            ' | tee -a certificate-results/certificates.txt
+
+      - name: Create GitHub Actions Summary
+        if: always()
+        shell: bash
+        run: |
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          {
+            echo "# Docker Certificate Check"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Docker Image | \`$IMAGE\` |"
+            echo "| Search Name | \`Himanshu\` |"
+            echo ""
+            echo "## Certificate Results"
+            echo ""
+            echo '```text'
+
+            if [[ -f certificate-results/certificates.txt ]]; then
+              cat certificate-results/certificates.txt
+            else
+              echo "No certificate result was generated."
+            fi
+
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload certificate list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-certificate-results
+          path: certificate-results/
+          if-no-files-found: warn

@@ -1,0 +1,228 @@
+name: Check Docker by cert name
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: "Docker image name. Examples: nginx, nginx:1.27, nginx@sha256:abc..."
+        required: true
+        type: string
+
+      image_version:
+        description: "Optional image version/tag. Leave empty when image_name already contains :tag or @sha256:digest"
+        required: false
+        default: ""
+        type: string
+
+      cert_name:
+        description: "Certificate name/text to search for. Example: Himanshu"
+        required: true
+        type: string
+
+jobs:
+  check-certificates:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build image reference
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMAGE_VERSION="${{ inputs.image_version }}"
+
+          IMAGE_NAME="$(echo "$IMAGE_NAME" | xargs)"
+          IMAGE_VERSION="$(echo "$IMAGE_VERSION" | xargs)"
+
+          if [[ -z "$IMAGE_NAME" ]]; then
+            echo "ERROR: image_name cannot be empty"
+            exit 1
+          fi
+
+          # Image with SHA256 digest
+          if [[ "$IMAGE_NAME" == *@sha256:* ]]; then
+
+            if [[ -n "$IMAGE_VERSION" ]]; then
+              echo "ERROR: image_version must be empty when using a digest."
+              exit 1
+            fi
+
+            IMAGE="$IMAGE_NAME"
+
+          # Image already contains a tag
+          elif [[ "$IMAGE_NAME" == *:* ]]; then
+
+            if [[ -n "$IMAGE_VERSION" ]]; then
+              echo "ERROR: image_name already contains a tag."
+              exit 1
+            fi
+
+            IMAGE="$IMAGE_NAME"
+
+          # Image + optional version
+          else
+
+            if [[ -n "$IMAGE_VERSION" ]]; then
+              IMAGE="${IMAGE_NAME}:${IMAGE_VERSION}"
+            else
+              IMAGE="${IMAGE_NAME}:latest"
+            fi
+
+          fi
+
+          echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "Final Docker image: $IMAGE"
+
+      - name: Pull Docker image
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          echo "Pulling: $IMAGE"
+
+          docker pull "$IMAGE"
+
+      - name: Find certificates matching requested name
+        shell: bash
+        env:
+          CERT_NAME: ${{ inputs.cert_name }}
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          if [[ -z "$CERT_NAME" ]]; then
+            echo "ERROR: cert_name cannot be empty"
+            exit 1
+          fi
+
+          mkdir -p certificate-results
+
+          RESULT_FILE="certificate-results/matching-certificates.txt"
+
+          {
+            echo "Docker Image: $IMAGE"
+            echo "Search Name: $CERT_NAME"
+            echo ""
+            echo "=============================================="
+            echo "Matching Certificates"
+            echo "=============================================="
+          } > "$RESULT_FILE"
+
+          echo "Searching for certificates matching: $CERT_NAME"
+
+          # Find certificate files inside the image.
+          docker run --rm \
+            --user 0 \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c '
+              find / \
+                -type f \
+                \( \
+                  -iname "*.crt" \
+                  -o -iname "*.cer" \
+                  -o -iname "*.pem" \
+                  -o -iname "*.der" \
+                \) \
+                -print 2>/dev/null
+            ' > /tmp/cert-files.txt
+
+          FOUND=0
+
+          while IFS= read -r CERT; do
+
+            [[ -z "$CERT" ]] && continue
+
+            MATCH_OUTPUT=$(
+              docker run --rm \
+                --user 0 \
+                --entrypoint /bin/sh \
+                -e CERT_PATH="$CERT" \
+                -e CERT_NAME="$CERT_NAME" \
+                "$IMAGE" \
+                -c '
+                  if ! command -v openssl >/dev/null 2>&1; then
+                    exit 0
+                  fi
+
+                  OUTPUT=$(openssl x509 \
+                    -in "$CERT_PATH" \
+                    -noout \
+                    -subject \
+                    -issuer \
+                    -dates \
+                    2>/dev/null || true)
+
+                  if echo "$OUTPUT" | grep -qi -- "$CERT_NAME"; then
+                    echo "$OUTPUT"
+                  fi
+                ' 2>/dev/null || true
+            )
+
+            if [[ -n "$MATCH_OUTPUT" ]]; then
+
+              FOUND=1
+
+              {
+                echo ""
+                echo "Certificate: $CERT"
+                echo "$MATCH_OUTPUT"
+                echo "----------------------------------------------"
+              } >> "$RESULT_FILE"
+
+            fi
+
+          done < /tmp/cert-files.txt
+
+          if [[ "$FOUND" -eq 0 ]]; then
+            {
+              echo ""
+              echo "No certificates matching '$CERT_NAME' were found."
+            } >> "$RESULT_FILE"
+          fi
+
+          echo ""
+          echo "========== MATCHING CERTIFICATES =========="
+
+          cat "$RESULT_FILE"
+
+      - name: Create GitHub Actions Summary
+        if: always()
+        env:
+          CERT_NAME: ${{ inputs.cert_name }}
+        run: |
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          {
+            echo "# Docker Certificate Check"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Docker Image | \`$IMAGE\` |"
+            echo "| Certificate Search | \`$CERT_NAME\` |"
+            echo ""
+            echo "## Matching Certificates"
+            echo ""
+            echo '```text'
+
+            if [[ -f certificate-results/matching-certificates.txt ]]; then
+              cat certificate-results/matching-certificates.txt
+            else
+              echo "No result was generated."
+            fi
+
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload matching certificates list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matching-certificate-results
+          path: certificate-results/matching-certificates.txt
+          if-no-files-found: warn

@@ -1,20 +1,191 @@
-name: CI
+name: Check Docker Image Certificates
 
 on:
-  push:
-    branches: [ "main" ]
-
   workflow_dispatch:
+    inputs:
+      image_name:
+        description: "Docker image name, e.g. nginx or myregistry/myapp"
+        required: true
+        type: string
+
+      image_version:
+        description: "Docker image version/tag. Leave empty to use latest"
+        required: false
+        default: ""
+        type: string
 
 jobs:
-  build:
+  check-certificates:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Run a one-line script
-        run: echo Hello, world!
 
-      - name: Run a multi-line script
+    steps:
+      - name: Build image reference
+        id: image
+        shell: bash
         run: |
-          echo ${{ github.ref }}
-          echo ${{ github.event_name }}
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMAGE_VERSION="${{ inputs.image_version }}"
+
+          if [[ -z "$IMAGE_VERSION" ]]; then
+            IMAGE_VERSION="latest"
+          fi
+
+          IMAGE="${IMAGE_NAME}:${IMAGE_VERSION}"
+
+          echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "Docker image: $IMAGE"
+
+      - name: Pull Docker image
+        run: |
+          docker pull "${{ steps.image.outputs.IMAGE }}"
+
+      - name: Check certificates for Himanshu
+        shell: bash
+        run: |
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          mkdir -p certificate-results
+
+          echo "Docker Image: $IMAGE" \
+            | tee certificate-results/certificates.txt
+
+          echo "Search Name: Himanshu" \
+            | tee -a certificate-results/certificates.txt
+
+          echo "" | tee -a certificate-results/certificates.txt
+          echo "==============================================" \
+            | tee -a certificate-results/certificates.txt
+          echo "Certificates containing 'Himanshu'" \
+            | tee -a certificate-results/certificates.txt
+          echo "==============================================" \
+            | tee -a certificate-results/certificates.txt
+
+          docker run --rm \
+            --user 0 \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c '
+              if command -v find >/dev/null 2>&1; then
+
+                find / \
+                  -type f \
+                  \( \
+                    -iname "*.crt" \
+                    -o -iname "*.cer" \
+                    -o -iname "*.pem" \
+                    -o -iname "*.der" \
+                  \) \
+                  -print 2>/dev/null
+
+              else
+                echo "ERROR: find command is not available in the image"
+              fi
+            ' > certificate-results/all-certificates.txt
+
+          echo "" >> certificate-results/certificates.txt
+          echo "All certificate files found:" \
+            | tee -a certificate-results/certificates.txt
+
+          cat certificate-results/all-certificates.txt \
+            | tee -a certificate-results/certificates.txt
+
+          echo "" | tee -a certificate-results/certificates.txt
+          echo "==============================================" \
+            | tee -a certificate-results/certificates.txt
+          echo "Checking certificate subject/issuer" \
+            | tee -a certificate-results/certificates.txt
+          echo "==============================================" \
+            | tee -a certificate-results/certificates.txt
+
+          docker run --rm \
+            --user 0 \
+            --entrypoint /bin/sh \
+            -v "$PWD/certificate-results:/results" \
+            "$IMAGE" \
+            -c '
+              FOUND=0
+
+              while IFS= read -r CERT; do
+
+                [ -z "$CERT" ] && continue
+
+                echo ""
+                echo "Certificate: $CERT"
+
+                if command -v openssl >/dev/null 2>&1; then
+
+                  OUTPUT=$(openssl x509 \
+                    -in "$CERT" \
+                    -noout \
+                    -subject \
+                    -issuer \
+                    -dates \
+                    2>/dev/null || true)
+
+                  if echo "$OUTPUT" | grep -qi "Himanshu"; then
+                    echo "MATCH: Himanshu"
+                    echo "$OUTPUT"
+                    FOUND=1
+                  fi
+
+                else
+
+                  echo "WARNING: openssl is not installed in the image"
+
+                  if grep -aiq "Himanshu" "$CERT" 2>/dev/null; then
+                    echo "MATCH: Himanshu found in certificate file"
+                    FOUND=1
+                  fi
+
+                fi
+
+              done < /results/all-certificates.txt
+
+              if [ "$FOUND" -eq 1 ]; then
+                echo ""
+                echo "RESULT: Himanshu certificate FOUND"
+                exit 0
+              else
+                echo ""
+                echo "RESULT: Himanshu certificate NOT FOUND"
+                exit 0
+              fi
+            ' | tee -a certificate-results/certificates.txt
+
+      - name: Create GitHub Actions Summary
+        if: always()
+        shell: bash
+        run: |
+          IMAGE="${{ steps.image.outputs.IMAGE }}"
+
+          {
+            echo "# Docker Certificate Check"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Docker Image | \`$IMAGE\` |"
+            echo "| Search Name | \`Himanshu\` |"
+            echo ""
+
+            echo "## Certificate Results"
+            echo ""
+            echo '```text'
+
+            if [ -f certificate-results/certificates.txt ]; then
+              cat certificate-results/certificates.txt
+            else
+              echo "No certificate result was generated."
+            fi
+
+            echo '```'
+
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload certificate list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-certificate-results
+          path: certificate-results/
+          if-no-files-found: warn
